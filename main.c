@@ -3,7 +3,7 @@
 #include <string.h>
 #include "jpeg/jpg.h"
 
-static const char* const JPG_FILE_PATH = "";
+static const char* const JPG_FILE_PATH = "/home/maxim/Projects/encoder/data/input/jpeg/gorilla.jpg";
 
 int main() {
     if (JPG_FILE_PATH[0] == '\0') {

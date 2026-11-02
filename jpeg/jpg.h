@@ -158,7 +158,6 @@ typedef struct Header {
 
     QuantizationTable quantization_tables[QUAN_TABLES_N];
 
-
     uint8_t frame_type;
     int64_t height;
     int64_t width;
@@ -178,6 +177,15 @@ typedef struct Header {
     uint8_t successive_approximation_low;
 
     Vector* huffman_data;
+
+    uint32_t mcu_height;
+    uint32_t mcu_width;
+    uint32_t mcu_height_real;
+    uint32_t mcu_width_real;
+
+    // storing directly inside so that we can access it directly and don't have to find proper ColorComponent each time
+    uint8_t horizontal_sampling_factor;
+    uint8_t vertical_sampling_factor;
 } Header;
 
 typedef struct MCU {

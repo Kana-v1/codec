@@ -32,7 +32,7 @@ static int32_t* get_mcu_component(MCU* mcu, uint8_t color_component_idx);
 
 static int8_t dequantize_mcu_component(QuantizationTable* qtable, MCU* mcu, uint8_t color_component_idx);
 static int8_t inverse_dct_component(MCU* mcu, uint8_t color_component_idx);
-static void YCbCr_to_RGB_MCU(MCU* mcu);
+static void YCbCr_to_RGB_MCU(const Header* header, MCU* mcu, MCU* cbcr, uint32_t v, uint32_t h);
 
 static uint8_t read_len(FILE* file, int64_t* out);
 static uint8_t read_bytes(FILE* file, unsigned char* out, uint8_t size);
@@ -191,8 +191,8 @@ void print_header(const Header* header) {
 }
 
 MCU* decode_huffman_data(Header* const header) {
-    const uint32_t mcu_height = (header->height + MCU_W_H - 1) / MCU_W_H;
-    const uint32_t mcu_width = (header->width + MCU_W_H - 1) / MCU_W_H;
+    uint32_t mcu_height = header->mcu_height_real;
+    uint32_t mcu_width = header->mcu_width_real;
 
     MCU* mcus = calloc((size_t)mcu_width * mcu_height, sizeof(MCU));
     if (!mcus) {
@@ -214,28 +214,43 @@ MCU* decode_huffman_data(Header* const header) {
 
     int32_t prev_DCs[COLORS_N] = {0};
 
-    for (uint32_t i = 0; i < mcu_width * mcu_height; i++) {
-        if (i != 0 &&
-            header->restart_interval != 0 &&
-            i % header->restart_interval == 0) {
-            for (uint8_t j = 0; j < COLORS_N; j++) {
-                prev_DCs[j] = 0;
+    mcu_height = header->mcu_height;
+    mcu_width = header->mcu_width;
+
+    int64_t restart_interval = header->restart_interval * header->horizontal_sampling_factor * header->vertical_sampling_factor; // convert from block number measurement to the "units of MCUs"
+
+    uint64_t mcu_count = 0;
+    for (uint32_t y = 0; y < mcu_height; y += header->vertical_sampling_factor) {
+        for (uint32_t x = 0; x < mcu_width; x += header->horizontal_sampling_factor) {
+            if (mcu_count != 0 && restart_interval != 0 && mcu_count % restart_interval == 0) {
+                for (uint8_t j = 0; j < COLORS_N; j++) {
+                    prev_DCs[j] = 0;
+                }
+
+                skip_byte(bit_reader);
             }
 
-            skip_byte(bit_reader);
-        }
+            // read Y1  Y2  Y3  Y4  Cb  Cr(for 4:2:0 subsampling)
+            for (uint8_t i = 0; i < header->num_components; i++) {
+                for (uint32_t v = 0; v < header->color_components[i].vertical_sampling_factor; v++) {
+                    for (uint32_t h = 0; h < header->color_components[i].horizontal_sampling_factor; h++) {
+                        const uint32_t pos = (y + v) * header->mcu_width_real + (x + h);
 
-        for (uint8_t j = 0; j < header->num_components; j++) {
-            if (!decode_mcu_component(
-                bit_reader,
-                &mcus[i],
-                j,
-                prev_DCs,
-                &header->huffman_ac_tables[header->color_components[j].huffman_ac_table_id],
-                &header->huffman_dc_tables[header->color_components[j].huffman_dc_table_id]
-            )) {
-                goto exit_ERR;
+                        if (!decode_mcu_component(
+                            bit_reader,
+                            &mcus[pos],
+                            i,
+                            prev_DCs,
+                            &header->huffman_ac_tables[header->color_components[i].huffman_ac_table_id],
+                            &header->huffman_dc_tables[header->color_components[i].huffman_dc_table_id]
+                        )) {
+                            goto exit_ERR;
+                        }
+                    }
+                }
             }
+
+            mcu_count++;
         }
     }
 
@@ -250,17 +265,22 @@ exit_ERR:
 }
 
 int dequantize(Header* header, MCU* mcus) {
-    const uint32_t mcu_height = (header->height + MCU_W_H - 1) / MCU_W_H; // ceil(header->height / MCU_H)
-    const uint32_t mcu_width = (header->width + MCU_W_H - 1) / MCU_W_H; // ceil(header->width / MCU_W)
+    for (uint32_t y = 0; y < header->mcu_height; y += header->vertical_sampling_factor) {
+        for (uint32_t x = 0; x < header->mcu_width; x += header->horizontal_sampling_factor) {
+            for (uint8_t i = 0; i < header->num_components; i++) {
+                for (uint32_t v = 0; v < header->color_components[i].vertical_sampling_factor; v++) {
+                    for (uint32_t h = 0; h < header->color_components[i].horizontal_sampling_factor; h++) {
+                        const uint32_t pos = (y + v) * header->mcu_width_real + (x + h);
 
-    for (uint32_t i = 0; i < mcu_width * mcu_height; i++) {
-        for (uint8_t j = 0; j < header->num_components; j++) {
-            if (dequantize_mcu_component(
-                    &header->quantization_tables[header->color_components[j].quantization_table_id],
-                    &mcus[i],
-                    j
-                ) < 0) {
-                return 1;
+                        if (dequantize_mcu_component(
+                                &header->quantization_tables[header->color_components[i].quantization_table_id],
+                                &mcus[pos],
+                                i
+                            ) < 0) {
+                            return 1;
+                        }
+                    }
+                }
             }
         }
     }
@@ -269,13 +289,18 @@ int dequantize(Header* header, MCU* mcus) {
 }
 
 int inverse_dct(const Header* header, MCU* mcus) {
-    const uint32_t mcu_height = (header->height + MCU_W_H - 1) / MCU_W_H; // ceil(header->height / MCU_H)
-    const uint32_t mcu_width = (header->width + MCU_W_H - 1) / MCU_W_H; // ceil(header->width / MCU_W)
+    for (uint32_t y = 0; y < header->mcu_height; y += header->vertical_sampling_factor) {
+        for (uint32_t x = 0; x < header->mcu_width; x += header->horizontal_sampling_factor) {
+            for (uint8_t i = 0; i < header->num_components; i++) {
+                for (uint32_t v = 0; v < header->color_components[i].vertical_sampling_factor; v++) {
+                    for (uint32_t h = 0; h < header->color_components[i].horizontal_sampling_factor; h++) {
+                        const uint32_t pos = (y + v) * header->mcu_width_real + (x + h);
 
-    for (uint32_t i = 0; i < mcu_width * mcu_height; i++) {
-        for (uint8_t j = 0; j < header->num_components; j++) {
-            if (inverse_dct_component(&mcus[i], j) < 0) {
-                return -1;
+                        if (inverse_dct_component(&mcus[pos], i) < 0) {
+                            return -1;
+                        }
+                    }
+                }
             }
         }
     }
@@ -284,11 +309,19 @@ int inverse_dct(const Header* header, MCU* mcus) {
 }
 
 void YCbCr_to_RGB(const Header* header, MCU* mcus) {
-    const uint32_t mcu_height = (header->height + MCU_W_H - 1) / MCU_W_H; // ceil(header->height / MCU_H)
-    const uint32_t mcu_width = (header->width + MCU_W_H - 1) / MCU_W_H; // ceil(header->width / MCU_W)
+    for (uint32_t y = 0; y < header->mcu_height; y += header->vertical_sampling_factor) {
+        for (uint32_t x = 0; x < header->mcu_width; x += header->horizontal_sampling_factor) {
+            MCU* cbcr = &mcus[y * header->mcu_width_real + x];
 
-    for (uint32_t i = 0; i < mcu_width * mcu_height; i++) {
-        YCbCr_to_RGB_MCU(&mcus[i]);
+            for (int32_t v = header->vertical_sampling_factor - 1; v >= 0; v--) {
+                for (int32_t h = header->horizontal_sampling_factor - 1; h >= 0; h--) {
+                    const uint32_t pos = (y + v) * header->mcu_width_real + (x + h);
+                    MCU* mcu = &mcus[pos];
+
+                    YCbCr_to_RGB_MCU(header, mcu, cbcr, v, h);
+                }
+            }
+        }
     }
 }
 
@@ -300,9 +333,6 @@ int write_bitmap(const Header* const header, const MCU* const mcus, const char* 
     }
 
     int res = 0;
-
-    const uint32_t mcu_height = (header->height + MCU_W_H - 1) / MCU_W_H; // ceil(header->height / MCU_H)
-    const uint32_t mcu_width = (header->width + MCU_W_H - 1) / MCU_W_H; // ceil(header->width / MCU_W)
 
     const uint32_t padding_size = header->width % BMP_ROW_ALIGNMENT;
     const uint32_t file_size = 14 + // first part of the header
@@ -362,7 +392,7 @@ int write_bitmap(const Header* const header, const MCU* const mcus, const char* 
             const uint64_t mcu_column = x / MCU_W_H;
             const uint64_t pixel_column = x % MCU_W_H;
 
-            const uint64_t mcu_idx = mcu_row * mcu_width + mcu_column;
+            const uint64_t mcu_idx = mcu_row * header->mcu_width_real + mcu_column;
             const uint64_t pixel_idx = pixel_row * MCU_W_H + pixel_column;
 
             const uint8_t bgr[3] = {
@@ -641,45 +671,50 @@ static void read_start_of_frame(FILE* file, Header* header) {
 
     if (header->num_components != 0) {
         printf("Multiple SOF detected\n");
-        goto fail;
+        goto exit_ERR;
     }
 
     int64_t len = 0;
     if (!read_len(file, &len) || len < 0) {
-        goto fail;
+        goto exit_ERR;
     }
 
     unsigned char precision = 0;
     if (!read_bytes(file, &precision, 1)) {
-        goto fail;
+        goto exit_ERR;
     }
 
     if (precision != 8) {
         printf("Invalid precision %d\n", precision);
-        goto fail;
+        goto exit_ERR;
     }
 
     if (!read_len(file, &header->height)) {
-        goto fail;
+        goto exit_ERR;
     }
 
     if (!read_len(file, &header->width)) {
-        goto fail;
+        goto exit_ERR;
     }
 
+    header->mcu_height = (header->height + MCU_W_H - 1) / MCU_W_H; // ceil(header->height / MCU_H)
+    header->mcu_width = (header->width + MCU_W_H - 1) / MCU_W_H; // ceil(header->width / MCU_W)
+    header->mcu_height_real = header->mcu_height;
+    header->mcu_width_real = header->mcu_width;
+
     if (!read_bytes(file, &header->num_components, 1)) {
-        goto fail;
+        goto exit_ERR;
     }
 
     if (header->num_components == 4 || header->num_components == 0) {
         printf("unsupported number of components %d\n", header->num_components);
-        goto fail;
+        goto exit_ERR;
     }
 
     for (uint8_t i = 0; i < header->num_components; i++) {
         unsigned char component_id = 0;
         if (!read_bytes(file, &component_id, 1)) {
-            goto fail;
+            goto exit_ERR;
         }
 
         if (component_id == 0) {
@@ -692,53 +727,75 @@ static void read_start_of_frame(FILE* file, Header* header) {
 
         if (component_id == 4 || component_id == 5) {
             printf("YIQ color mode is not supported\n");
-            goto fail;
+            goto exit_ERR;
         }
 
         // component id starts from 1, not from 0
         if (component_id == 0 || component_id > 3) {
             printf("invalid component id %d\n", component_id);
-            goto fail;
+            goto exit_ERR;
         }
 
         ColorComponent* component = &header->color_components[component_id - 1];
         if (component->used) {
             printf("duplicate color component ID\n");
-            goto fail;
+            goto exit_ERR;
         }
 
         component->used = true;
         unsigned char sampling_factor = 0;
         if (!read_bytes(file, &sampling_factor, 1)) {
-            goto fail;
+            goto exit_ERR;
         }
 
         component->horizontal_sampling_factor = sampling_factor >> 4;
         component->vertical_sampling_factor = sampling_factor & 0x0F;
 
-        if (component->horizontal_sampling_factor != 1 || component->vertical_sampling_factor != 1) {
-            printf("Sampling factors not supported\n");
-            goto fail;
+        if (component_id == 1) {
+            // luminance channel
+            if ((component->horizontal_sampling_factor != 1 && component->horizontal_sampling_factor != 2) ||
+                (component->vertical_sampling_factor != 1 && component->vertical_sampling_factor != 2)) {
+                printf("Sampling factors not supported\n");
+                goto exit_ERR;
+            }
+
+            if (component->horizontal_sampling_factor == 2 && header->mcu_width % 2 == 1) {
+                header->mcu_width_real++;
+            }
+
+            if (component->vertical_sampling_factor == 2 && header->mcu_height % 2 == 1) {
+                header->mcu_height_real++;
+            }
+
+            header->horizontal_sampling_factor = component->horizontal_sampling_factor;
+            header->vertical_sampling_factor = component->vertical_sampling_factor;
+        } else {
+            // chrominance channels
+            if (component->horizontal_sampling_factor != 1 || component->vertical_sampling_factor != 1) {
+                printf("Sampling factors not supported\n");
+                goto exit_ERR;
+            }
         }
 
+
         if (!read_bytes(file, &component->quantization_table_id, 1)) {
-            goto fail;
+            goto exit_ERR;
         }
         if (component->quantization_table_id > 3) {
             printf("invalid quantization table ID in frame components\n");
-            goto fail;
+            goto exit_ERR;
         }
     }
 
     // 8 - number of bytes we read from the start (precision, num_components, etc)
     if (len - 8 - (COLORS_N * header->num_components) != 0) {
         printf("SOF invalid\n");
-        goto fail;
+        goto exit_ERR;
     }
 
     return;
 
-fail:
+exit_ERR:
     header->valid = false;
 }
 
@@ -747,21 +804,21 @@ static void read_restart_interval(FILE* file, Header* header) {
 
     int64_t len = 0;
     if (!read_len(file, &len) || len < 0) {
-        goto fail;
+        goto exit_ERR;
     }
 
     if (!read_len(file, &header->restart_interval)) {
-        goto fail;
+        goto exit_ERR;
     }
 
     if (len - 4 != 0) {
         printf("DRI is invalid\n");
-        goto fail;
+        goto exit_ERR;
     }
 
     return;
 
-fail:
+exit_ERR:
     header->valid = false;
 }
 
@@ -770,7 +827,7 @@ static void read_huffman_table(FILE* file, Header* header) {
 
     int64_t len = 0;
     if (!read_len(file, &len) || len < 0) {
-        goto fail;
+        goto exit_ERR;
     }
 
     len -= MARKERS_LEN;
@@ -781,7 +838,7 @@ static void read_huffman_table(FILE* file, Header* header) {
 
     while (len > 0) {
         if (!read_bytes(file, &table_info, 1)) {
-            goto fail;
+            goto exit_ERR;
         }
 
         table_id = table_info & 0x0F;
@@ -789,7 +846,7 @@ static void read_huffman_table(FILE* file, Header* header) {
 
         if (table_id > HUFFMAN_TABLES_N - 1) {
             printf("invalid table id %d\n", table_id);
-            goto fail;
+            goto exit_ERR;
         }
 
         HuffmanTable* htable = 0;
@@ -803,7 +860,7 @@ static void read_huffman_table(FILE* file, Header* header) {
 
         unsigned char symbols_num[HUFFMAN_MAX_N_OF_CODES] = {0};
         if (!read_bytes(file, symbols_num, HUFFMAN_MAX_N_OF_CODES)) {
-            goto fail;
+            goto exit_ERR;
         }
 
         uint64_t cur_symbol_start_idx = 0;
@@ -815,12 +872,12 @@ static void read_huffman_table(FILE* file, Header* header) {
 
         if (cur_symbol_start_idx > HUFFMAN_AC_TABLE_SYMBOLS_N) {
             printf("too many symbols in Huffman table\n");
-            goto fail;
+            goto exit_ERR;
         }
 
         for (uint64_t i = 0; i < cur_symbol_start_idx; i++) {
             if (!read_bytes(file, &htable->symbols[i], 1)) {
-                goto fail;
+                goto exit_ERR;
             }
         }
 
@@ -829,12 +886,12 @@ static void read_huffman_table(FILE* file, Header* header) {
 
     if (len != 0) {
         printf("DHT invalid\n");
-        goto fail;
+        goto exit_ERR;
     }
 
     return;
 
-fail:
+exit_ERR:
     header->valid = false;
 }
 
@@ -843,12 +900,12 @@ static void read_start_of_scan(FILE* file, Header* header) {
 
     if (header->num_components == 0) {
         printf("SOS detected before the SOF\n");
-        goto fail;
+        goto exit_ERR;
     }
 
     int64_t len = 0;
     if (!read_len(file, &len) || len < 0) {
-        goto fail;
+        goto exit_ERR;
     }
 
     for (uint8_t i = 0; i < COLORS_N; i++) {
@@ -857,13 +914,13 @@ static void read_start_of_scan(FILE* file, Header* header) {
 
     unsigned char num_components = 0;
     if (!read_bytes(file, &num_components, 1)) {
-        goto fail;
+        goto exit_ERR;
     }
 
     for (uint8_t i = 0; i < num_components; i++) {
         unsigned char component_id = 0;
         if (!read_bytes(file, &component_id, 1)) {
-            goto fail;
+            goto exit_ERR;
         }
 
         if (header->zero_based) {
@@ -872,20 +929,20 @@ static void read_start_of_scan(FILE* file, Header* header) {
 
         if (component_id > header->num_components || component_id < 1) {
             printf("invalid color component ID: %d\n", component_id);
-            goto fail;
+            goto exit_ERR;
         }
 
         ColorComponent* component = &header->color_components[component_id - 1];
         if (component->used) {
             printf("duplicate color component\n");
-            goto fail;
+            goto exit_ERR;
         }
 
         component->used = true;
 
         unsigned char huffman_table_ids = 0;
         if (!read_bytes(file, &huffman_table_ids, 1)) {
-            goto fail;
+            goto exit_ERR;
         }
 
         component->huffman_dc_table_id = huffman_table_ids >> 4;
@@ -893,17 +950,17 @@ static void read_start_of_scan(FILE* file, Header* header) {
 
         if (component->huffman_ac_table_id >= HUFFMAN_TABLES_N) {
             printf("invalid huffman ac table id: %d\n", component->huffman_ac_table_id);
-            goto fail;
+            goto exit_ERR;
         }
         if (component->huffman_dc_table_id >= HUFFMAN_TABLES_N) {
             printf("invalid huffman dc table id: %d\n", component->huffman_dc_table_id);
-            goto fail;
+            goto exit_ERR;
         }
     }
 
     unsigned char remaining_fields[3] = {0};
     if (!read_bytes(file, remaining_fields, 3)) {
-        goto fail;
+        goto exit_ERR;
     }
 
     header->start_of_selection = remaining_fields[0];
@@ -913,22 +970,22 @@ static void read_start_of_scan(FILE* file, Header* header) {
 
     if (header->start_of_selection != 0 || header->end_of_selection != 63) {
         printf("invalid spectral selection\n");
-        goto fail;
+        goto exit_ERR;
     }
 
     if (header->successive_approximation_high != 0 || header->successive_approximation_low != 0) {
         printf("invalid successive approximation\n");
-        goto fail;
+        goto exit_ERR;
     }
 
     if (len - 6 - (2 * num_components) != 0) {
         printf("SOS invalid\n");
-        goto fail;
+        goto exit_ERR;
     }
 
     return;
 
-fail:
+exit_ERR:
     header->valid = false;
 }
 
@@ -1361,24 +1418,34 @@ static int8_t inverse_dct_component_slow(MCU* mcu, const uint8_t color_component
     return 0;
 }
 
-static void YCbCr_to_RGB_MCU(MCU* mcu) {
-    for (uint8_t i = 0; i < MCU_VALUES_N; i++) {
-        // + 128 because after inverse dct YCbCr values end up in the range [-128; 127] instead of [0; 255]
-        // we could add 128 during inverse dct but it would require differnt consts
-        int32_t rgb[COLORS_N] = {
-            mcu->y[i] + 1.402f * mcu->cr[i] + 128, // r
-            mcu->y[i] - 0.344f * mcu->cb[i] - 0.714f * mcu->cr[i] + 128, // g
-            mcu->y[i] + 1.772f * mcu->cb[i] + 128, // b
-        };
+static void YCbCr_to_RGB_MCU(const Header* header, MCU* mcu, MCU* cbcr, uint32_t v, uint32_t h) {
+    for (int8_t y = MCU_W_H - 1; y >= 0; y--) {
+        for (int8_t x = MCU_W_H - 1; x >= 0; x--) {
+            const uint8_t pixel = y * MCU_W_H + x;
 
-        for (uint8_t j = 0; j < COLORS_N; j++) {
-            if (rgb[j] < 0) rgb[j] = 0;
-            if (rgb[j] > 255) rgb[j] = 255;
+            const uint8_t cbcr_pixel_row = y / header->vertical_sampling_factor + // make y to be [0; 3] instead of [0; 7]
+                                           4 * v; // make y [4; 7] for non zero v to "stretch" color across all cells
+            const uint8_t cbcr_pixel_col = x / header->horizontal_sampling_factor +
+                                           4 * h;
+            const uint8_t cbcr_pixel = cbcr_pixel_row * MCU_W_H + cbcr_pixel_col;
+
+            // + 128 because after inverse dct YCbCr values end up in the range [-128; 127] instead of [0; 255]
+            // we could add 128 during inverse dct but it would require different consts
+            int32_t rgb[COLORS_N] = {
+                mcu->y[pixel] + 1.402f * cbcr->cr[cbcr_pixel] + 128, // r
+                mcu->y[pixel] - 0.344f * cbcr->cb[cbcr_pixel] - 0.714f * cbcr->cr[cbcr_pixel] + 128, // g
+                mcu->y[pixel] + 1.772f * cbcr->cb[cbcr_pixel] + 128, // b
+            };
+
+            for (uint8_t j = 0; j < COLORS_N; j++) {
+                if (rgb[j] < 0) rgb[j] = 0;
+                if (rgb[j] > 255) rgb[j] = 255;
+            }
+
+            mcu->r[pixel] = rgb[0];
+            mcu->g[pixel] = rgb[1];
+            mcu->b[pixel] = rgb[2];
         }
-
-        mcu->r[i] = rgb[0];
-        mcu->g[i] = rgb[1];
-        mcu->b[i] = rgb[2];
     }
 }
 
